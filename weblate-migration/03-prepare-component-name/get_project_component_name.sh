@@ -46,11 +46,12 @@ function get_python_component_names {
             fi
         done
 
-        if [ -f $PROJECT_DIR/releasenotes/source/conf.py ]; then
+        if [ -f $PROJECT_DIR/releasenotes/source/conf.py ] && \
+           [ -f $POT_DIR/releasenotes/source/locale/releasenotes.pot ]; then
             components+=("releasenotes")
         fi
     fi
-    
+
     echo "${components[@]}"
 }
 
@@ -78,7 +79,8 @@ function get_django_component_names {
     fi
 
     if [ -n "$module_names" ]; then
-        if [[ -f $PROJECT_DIR/releasenotes/source/conf.py ]]; then
+        if [[ -f $PROJECT_DIR/releasenotes/source/conf.py ]] && \
+           [[ -f $POT_DIR/releasenotes/source/locale/releasenotes.pot ]]; then
             components+=("releasenotes")
         fi
 
