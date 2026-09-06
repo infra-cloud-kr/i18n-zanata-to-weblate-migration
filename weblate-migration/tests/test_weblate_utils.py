@@ -7,7 +7,9 @@
 #      http://www.apache.org/licenses/LICENSE-2.0
 
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -433,6 +435,42 @@ class WeblateUtilsPoFormatTest(unittest.TestCase):
         result = self.utils.check_po_format(
             'heat', 'master', 'heat', 'fr', str(weblate_po),
         )
+
+        self.assertTrue(result)
+
+    def test_check_po_format_survives_non_utf8_msgfmt_stderr(self):
+        # Mirrors the real barbican/zh_CN case (issue #42): msgfmt
+        # wrote a non-UTF-8 byte to stderr and text=True's strict
+        # decode raised UnicodeDecodeError, aborting the whole locale
+        # instead of being recorded as a warning. Uses a fake msgfmt
+        # placed ahead on PATH so the real subprocess/decode path
+        # (not just check_po_format's own logic) is exercised.
+        weblate_po = self._write_po(
+            'msgid ""\nmsgstr ""\n'
+            '"Content-Type: text/plain; charset=UTF-8\\n"\n\n'
+            'msgid "Hello"\nmsgstr "Ni hao"\n'
+        )
+        fake_bin_dir = Path(
+            f'{self.id().replace(".", "-")}-fakebin'
+        )
+        fake_bin_dir.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, fake_bin_dir, ignore_errors=True)
+        fake_msgfmt = fake_bin_dir / 'msgfmt'
+        fake_msgfmt.write_text(
+            '#!/usr/bin/env python3\n'
+            'import sys\n'
+            "sys.stderr.buffer.write(b'invalid multibyte: \\xe6 boom\\n')\n"
+            'sys.exit(1)\n'
+        )
+        fake_msgfmt.chmod(0o755)
+
+        with mock.patch.dict(
+            'os.environ',
+            {'PATH': f'{fake_bin_dir.resolve()}:{os.environ["PATH"]}'},
+        ):
+            result = self.utils.check_po_format(
+                'barbican', 'master', 'barbican', 'zh_CN', str(weblate_po),
+            )
 
         self.assertTrue(result)
 
