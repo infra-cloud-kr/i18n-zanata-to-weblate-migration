@@ -2169,9 +2169,15 @@ class WeblateUtils:
         :returns: True unless msgfmt itself could not be run
         """
         try:
+            # errors='replace': msgfmt's stderr isn't guaranteed valid
+            # UTF-8 (e.g. it can echo back a mis-encoded byte sequence
+            # from the very PO content it's complaining about), and a
+            # strict decode failure here would raise UnicodeDecodeError
+            # and abort this locale's check entirely - defeating the
+            # warn-don't-fail behavior below.
             result = subprocess.run(
                 ['msgfmt', '--check', '-o', os.devnull, weblate_po_path],
-                capture_output=True, text=True,
+                capture_output=True, text=True, errors='replace',
             )
         except FileNotFoundError:
             error_msg = (
