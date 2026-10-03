@@ -6,7 +6,7 @@
 ## 문제 원인
 
 - setup.cfg에서 pyproject.toml로 전환되면서, 파이썬 도메인 대상으로 pot가 정상적으로 추출되지 않았다. 이로 인해 upstream-translation-update 시 zanata에서 obsolete docs로 적용되면서 Zanata 상에 보여지지 않았다.
-  - zanata에서 obsolete docs 문서가 되면, 아무에게도 보여지지 않게 된다.
+  - zanata에서 obsolete docs 문서가 되면, zanata 상에서 보여지지 않는다.
 
 > the relative path `messages/kdeedu/kalzium.pot` will be the document's unique identifier inside Zanata. If you change `src-dir` setting later, e.g. to ".", which results in a change of the relative path to `templates/messages/kdeedu/kalzium.pot`, pushing again will create a new document with the new path as its unique identifier, and the old document will be considered obsolete and will not be visible to anyone. The old document's translations will not be copied to the new document automatically, but they will appear as Translation Memory matches. This can be confusing and frustrating for translators.
 >
