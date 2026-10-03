@@ -177,7 +177,7 @@
 
 ### ironic, neutron, nova, neutron-lib, python-heatclient, python-openstackclient
 
-- designate와 동일한 upstream-translation-update 로그가 보여준다.
+- designate와 동일하게 파이썬 도메인 모듈이 `find.pot`로 추출된다. 
   - 전환 시점의 로그는 보관 기간이 지나 확인할 수 없어, 최신 로그에서 `find`로 추출된다. 
 
 
