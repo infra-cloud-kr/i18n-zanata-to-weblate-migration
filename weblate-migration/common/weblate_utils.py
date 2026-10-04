@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 from typing import Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 import polib
 import requests
@@ -891,7 +891,7 @@ class WeblateUtils:
                         break
                 if not all_ready:
                     break
-                page_url = data.get('next')
+                page_url = self._next_page_url(data)
 
             if all_ready and checked > 0:
                 print(f"[INFO] Plural slots ready: {locale} "
@@ -918,6 +918,51 @@ class WeblateUtils:
                 f'{sanitize_slug(category_name)}%252F'
                 f'{sanitize_slug(component_name)}')
 
+    def _next_page_url(self, data: dict):
+        """Get a paginated response's next page URL on WEBLATE_URL's host.
+
+        Weblate builds 'next' from what it thinks its own URL is, which
+        behind a TLS-terminating proxy can be http:// even though the
+        API is served over https:// (seen on weblate.printf.kr). Every
+        request here refuses redirects (see _reject_redirect), so
+        following that URL as-is fails on the 301 to https://. Only its
+        path and query are kept; scheme and host come from WEBLATE_URL.
+
+        :param data: decoded JSON body of a paginated list response
+        :returns: next page URL, or None on the last page
+        """
+        next_url = data.get('next')
+        if not next_url:
+            return None
+        base = urlsplit(self.base_url)
+        parts = urlsplit(next_url)
+        return urlunsplit(
+            (base.scheme, base.netloc, parts.path, parts.query, ''))
+
+    def _get_unit_count(self, translation_url: str):
+        """Get a translation's current unit count from the units API.
+
+        Used instead of the translation's 'total': that comes from
+        cached statistics, which Weblate only recalculates once the
+        whole background re-parse of a component has finished, so it
+        can lag the actual units by many minutes after a source update.
+
+        :param translation_url: translation API URL
+        :returns: (unit count or None, short detail for logging); None
+            when the translation isn't there yet (404) or the request
+            failed transiently - exits on a non-retryable failure
+        """
+        response = self._get(
+            urljoin(translation_url, 'units/?' + urlencode({'page_size': 1})))
+        if response.status_code == 200:
+            return response.json().get('count'), ''
+        if (response.status_code != 404
+                and not is_retryable_status(response.status_code)):
+            print(f"[ERROR] Failed to count units: {translation_url}: "
+                  f"HTTP {response.status_code}: {response.text}")
+            sys.exit(1)
+        return None, f"HTTP {response.status_code}: {response.text}"
+
     def _get_all_pages(self, url: str, action: str) -> list:
         """GET every page of a paginated Weblate list endpoint.
 
@@ -938,7 +983,7 @@ class WeblateUtils:
             )
             data = response.json()
             results.extend(data.get('results', []))
-            page_url = data.get('next')
+            page_url = self._next_page_url(data)
         return results
 
     def _get_translation_source_keys(self, translation_url: str) -> tuple:
@@ -965,11 +1010,11 @@ class WeblateUtils:
 
         Weblate (re)parses component files in a background task, so
         neither a component creation nor a source upload response
-        means the new source set is visible yet. The cheap 'total'
-        on the translation endpoint is polled first; only once it
-        equals the expected count is the full unit list fetched and
-        compared as a set - a count match alone would also accept the
-        old source set when strings were replaced one-for-one.
+        means the new source set is visible yet. The cheap unit count
+        (see _get_unit_count) is polled first; only once it equals the
+        expected count is the full unit list fetched and compared as a
+        set - a count match alone would also accept the old source set
+        when strings were replaced one-for-one.
 
         :param translation_url: translation API URL to poll
         :param label: label used in log and error messages
@@ -983,30 +1028,21 @@ class WeblateUtils:
         last_detail = "no response"
 
         for cnt in range(retry_count):
-            response = self._get(translation_url)
-            if response.status_code == 200:
-                total = response.json().get('total')
-                if total == expected_total:
-                    actual_keys, unit_count = (
-                        self._get_translation_source_keys(translation_url))
-                    if (actual_keys == expected_keys
-                            and unit_count == expected_total):
-                        print(f"[INFO] Source strings match POT: {label} "
-                              f"({expected_total} source strings)")
-                        return
-                    diff = describe_source_key_diff(
-                        expected_keys, actual_keys)
-                    last_detail = f"total={total}, {diff}"
-                else:
-                    last_detail = f"total={total}, expected={expected_total}"
-            elif (response.status_code != 404
-                    and not is_retryable_status(response.status_code)):
-                print(f"[ERROR] Failed while waiting for source strings "
-                      f"{label}: HTTP {response.status_code}: "
-                      f"{response.text}")
-                sys.exit(1)
+            count, count_detail = self._get_unit_count(translation_url)
+            if count is None:
+                last_detail = count_detail
+            elif count == expected_total:
+                actual_keys, unit_count = (
+                    self._get_translation_source_keys(translation_url))
+                if (actual_keys == expected_keys
+                        and unit_count == expected_total):
+                    print(f"[INFO] Source strings match POT: {label} "
+                          f"({expected_total} source strings)")
+                    return
+                diff = describe_source_key_diff(expected_keys, actual_keys)
+                last_detail = f"units={count}, {diff}"
             else:
-                last_detail = f"HTTP {response.status_code}: {response.text}"
+                last_detail = f"units={count}, expected={expected_total}"
 
             if cnt + 1 < retry_count:
                 print(f"[INFO] Waiting for source strings: {label} "
@@ -1064,22 +1100,19 @@ class WeblateUtils:
         """Compare one translation's current source set with the POT's.
 
         One-shot (no waiting). The full unit list is only fetched when
-        the cheap 'total' already equals the expected count - a total
-        mismatch is enough to know the set differs.
+        the cheap unit count already equals the expected count - a
+        count mismatch is enough to know the set differs.
 
         :param translation_url: translation API URL
         :param expected_keys: keys from get_pot_source_keys
         :returns: '' if the source set matches, otherwise a short
             description of the difference
         """
-        response = self._get_with_retry(
-            translation_url,
-            success=lambda r: r.status_code == 200,
-            action='Get translation for source check',
-        )
-        total = response.json().get('total')
-        if total != len(expected_keys):
-            return f"total={total}, expected={len(expected_keys)}"
+        count, count_detail = self._get_unit_count(translation_url)
+        if count is None:
+            return count_detail
+        if count != len(expected_keys):
+            return f"units={count}, expected={len(expected_keys)}"
         actual_keys, unit_count = self._get_translation_source_keys(
             translation_url)
         if actual_keys == expected_keys and unit_count == len(expected_keys):

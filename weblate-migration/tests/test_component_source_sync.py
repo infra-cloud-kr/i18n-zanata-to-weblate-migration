@@ -23,7 +23,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import zipfile
 
 import polib
@@ -83,6 +83,11 @@ class FakeWeblate:
     re-merges and re-parses languages whose file still differs from
     the POT - a language whose file is current but whose database copy
     is stale is left alone.
+
+    Also mirrors two quirks seen on the real test instance: a
+    translation's statistics 'total' keeps its old value until every
+    pending re-parse is done, and paginated responses advertise their
+    'next' page on http:// while http:// requests get a 301 to https://.
     """
 
     def __init__(self, existing_pot=None, languages=(), reparse_polls=1,
@@ -103,33 +108,49 @@ class FakeWeblate:
         self.source_upload_statuses = list(source_upload_statuses)
         self.page_size = page_size
         self.posts = []
+        # language code -> full unit list fetches (not count probes)
         self.unit_fetches = defaultdict(int)
+        # language code -> statistics total shown while re-parsing
+        self.stale_totals = {}
 
     # -- helpers ------------------------------------------------------
     def _schedule(self, keys, langs):
         for lang in langs:
+            self.stale_totals[lang] = len(self.visible.get(lang, ()))
             self.pending[lang] = [set(keys), self.reparse_polls]
 
-    def _units_page(self, lang, page):
+    def _poll(self, lang):
+        """One poll of a language - advances its pending re-parse."""
+        if lang in self.pending:
+            self.pending[lang][1] -= 1
+            if self.pending[lang][1] <= 0:
+                self.visible[lang] = self.pending.pop(lang)[0]
+
+    def _units_page(self, lang, page, page_size):
         keys = sorted(self.visible[lang])
-        start = (page - 1) * self.page_size
-        chunk = keys[start:start + self.page_size]
+        start = (page - 1) * page_size
+        chunk = keys[start:start + page_size]
         results = [
             {'context': ctxt,
              'source': [msgid, plural] if plural else [msgid]}
             for ctxt, msgid, plural in chunk
         ]
         next_url = None
-        if start + self.page_size < len(keys):
-            next_url = (f'{BASE_URL}translations/{COMPONENT_PATH}/{lang}/'
-                        f'units/?page={page + 1}')
-        return {'results': results, 'next': next_url}
+        if start + page_size < len(keys):
+            next_url = ('http://weblate.example/api/translations/'
+                        f'{COMPONENT_PATH}/{lang}/units/'
+                        f'?page={page + 1}&page_size={page_size}')
+        return {'count': len(keys), 'results': results, 'next': next_url}
 
     # -- requests.get / requests.post replacements ----------------------
     def get(self, url, headers=None, params=None, allow_redirects=None):
         parts = urlsplit(url)
+        if parts.scheme != 'https':
+            response = make_response(301, {})
+            response.headers = {'Location': url.replace('http:', 'https:')}
+            return response
         path = parts.path[len('/api/'):]
-        query = parts.query
+        query = parse_qs(parts.query)
 
         if path == f'components/{COMPONENT_PATH}/':
             return make_response(200 if self.exists else 404, {})
@@ -147,20 +168,26 @@ class FakeWeblate:
             rest = path[len(prefix):].strip('/').split('/')
             lang = rest[0]
             if len(rest) == 1:
-                if lang in self.pending:
-                    self.pending[lang][1] -= 1
-                    if self.pending[lang][1] <= 0:
-                        self.visible[lang] = self.pending.pop(lang)[0]
+                self._poll(lang)
+                if lang not in self.visible:
+                    return make_response(404, {'detail': 'Not found.'})
+                total = len(self.visible[lang])
+                if self.pending:
+                    total = self.stale_totals.get(lang, total)
+                return make_response(200, {'total': total})
+            if rest[1:] == ['units']:
+                page = int(query.get('page', ['1'])[0])
+                page_size = min(int(query.get('page_size', ['50'])[0]),
+                                self.page_size)
+                if page == 1:
+                    if query.get('page_size') == ['1']:
+                        self._poll(lang)
+                    else:
+                        self.unit_fetches[lang] += 1
                 if lang not in self.visible:
                     return make_response(404, {'detail': 'Not found.'})
                 return make_response(
-                    200, {'total': len(self.visible[lang])})
-            if rest[1:] == ['units']:
-                self.unit_fetches[lang] += 1
-                page = 1
-                if query.startswith('page='):
-                    page = int(query[len('page='):])
-                return make_response(200, self._units_page(lang, page))
+                    200, self._units_page(lang, page, page_size))
 
         raise AssertionError(f'Unexpected GET: {url}')
 
