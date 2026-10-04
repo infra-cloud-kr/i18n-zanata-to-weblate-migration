@@ -292,8 +292,13 @@ class WeblateUtilsReadinessTest(unittest.TestCase):
                 if state['source_checks'] == 1:
                     return make_response(200, {'total': 1})
 
-                state['ready'] = True
                 return make_response(200, {'total': 2})
+            if '/en_US/units/' in url:
+                state['ready'] = True
+                return make_response(200, {'results': [
+                    {'context': '', 'source': ['first']},
+                    {'context': '', 'source': ['second']},
+                ], 'next': None})
             self.fail(f'Unexpected GET: {url}')
 
         def create_component(url, data=None, files=None, headers=None,
