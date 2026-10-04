@@ -1580,6 +1580,15 @@ class WeblateUtils:
         strings Zanata does translate are left for the upload itself,
         which overwrites fuzzy strings.
 
+        A Zanata entry that is fuzzy but empty ('#, fuzzy' with an empty
+        msgstr) is emptied the same way: Weblate has no state for it.
+        A PO unit only counts as fuzzy when it has content (TTKitUnit.
+        is_fuzzy is has_translation() and isfuzzy()), so importing such
+        an entry yields an untranslated string, and the units API
+        rejects a non-empty state with an empty target. State 0 is
+        therefore exactly what a fresh migration of that entry gives;
+        upload_po_file warns about these entries.
+
         :param translation_url: translation API URL for this locale
         :param po: the parsed Zanata PO file about to be uploaded
         :param locale: locale label used in log messages
@@ -1704,6 +1713,18 @@ class WeblateUtils:
         translated_count = sum(
             1 for entry in po if not entry.obsolete
             and (entry.msgstr or any(entry.msgstr_plural.values())))
+        # Weblate can't store a fuzzy flag on an empty string (see
+        # _clear_fuzzy_guesses), so these always end up untranslated.
+        empty_fuzzy_count = sum(
+            1 for entry in po if not entry.obsolete
+            and 'fuzzy' in entry.flags
+            and not entry.msgstr
+            and not any(entry.msgstr_plural.values()))
+        if empty_fuzzy_count:
+            print(f"[WARN] {empty_fuzzy_count} fuzzy entries without "
+                  "translation in source will be untranslated on Weblate "
+                  "(no fuzzy state for an empty string): "
+                  f"{component_name} {locale}")
 
         # Before the early return below: a locale with no translation
         # at all in Zanata can still have guesses to clear.

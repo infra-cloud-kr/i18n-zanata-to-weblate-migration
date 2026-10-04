@@ -15,7 +15,9 @@ shell then skipped every PO upload for that component.
 """
 
 from collections import defaultdict
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -504,6 +506,64 @@ class ClearFuzzyGuessesTest(unittest.TestCase):
             [('/api/units/7/', {'state': 0, 'target': ['']})],
             self.patches)
         self.assertEqual([], self.uploads)
+
+    def run_upload_capturing(self, po_content, fuzzy_units):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            uploaded = self.run_upload(po_content, fuzzy_units)
+        return uploaded, out.getvalue()
+
+    def test_empty_fuzzy_source_is_emptied_and_reported(self):
+        # '#, fuzzy' with an empty msgstr is valid PO, but Weblate has
+        # no state for it: a PO unit only counts as fuzzy with content,
+        # and the API rejects a non-empty state with an empty target.
+        # The guess must still go, and the lost flag must be reported.
+        po = self.PO_HEADER + '#, fuzzy\nmsgid "29.0.0"\nmsgstr ""\n'
+        units = [{'id': 7, 'state': 10, 'context': '',
+                  'source': ['29.0.0'], 'target': ['9.0.0']}]
+
+        uploaded, output = self.run_upload_capturing(po, units)
+
+        self.assertFalse(uploaded)
+        self.assertEqual(
+            [('/api/units/7/', {'state': 0, 'target': ['']})],
+            self.patches)
+        self.assertIn('[WARN] 1 fuzzy entries without translation', output)
+
+    def test_empty_fuzzy_plural_source_is_emptied_and_reported(self):
+        po = self.PO_HEADER + (
+            '#, fuzzy\nmsgid "%d volume"\nmsgid_plural "%d volumes"\n'
+            'msgstr[0] ""\nmsgstr[1] ""\n\n'
+            'msgid "Bug Fixes"\nmsgstr "バグ修正"\n'
+        )
+        units = [{'id': 3, 'state': 10, 'context': '',
+                  'source': ['%d volume', '%d volumes'],
+                  'target': ['%d 個', '%d 個']}]
+
+        uploaded, output = self.run_upload_capturing(po, units)
+
+        self.assertTrue(uploaded)
+        self.assertEqual(
+            [('/api/units/3/', {'state': 0, 'target': ['', '']})],
+            self.patches)
+        self.assertEqual(1, len(self.uploads))
+        self.assertIn('[WARN] 1 fuzzy entries without translation', output)
+
+    def test_fuzzy_source_with_content_is_left_to_upload(self):
+        # Zanata's own fuzzy translation is migrated by the upload
+        # (fuzzy=process overwrites Weblate's guess and keeps it
+        # fuzzy) - nothing to clear and nothing to warn about.
+        po = self.PO_HEADER + (
+            '#, fuzzy\nmsgid "29.0.0"\nmsgstr "29.0.0 版"\n')
+        units = [{'id': 7, 'state': 10, 'context': '',
+                  'source': ['29.0.0'], 'target': ['9.0.0']}]
+
+        uploaded, output = self.run_upload_capturing(po, units)
+
+        self.assertTrue(uploaded)
+        self.assertEqual([], self.patches)
+        self.assertEqual(1, len(self.uploads))
+        self.assertNotIn('[WARN]', output)
 
     def test_nothing_to_clear_sends_no_patch(self):
         po = self.PO_HEADER + (
