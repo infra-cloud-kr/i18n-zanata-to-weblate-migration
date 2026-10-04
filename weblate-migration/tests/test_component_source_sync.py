@@ -406,6 +406,117 @@ class CreateComponentSourceSyncTest(unittest.TestCase):
         self.assertEqual(1, raised.exception.code)
 
 
+class ClearFuzzyGuessesTest(unittest.TestCase):
+    """upload_po_file must empty fuzzy guesses msgmerge made for strings
+    Zanata never translated, and nothing else."""
+
+    UNITS_PATH = f'translations/{COMPONENT_PATH}/ja/units/'
+
+    def setUp(self):
+        config = SimpleNamespace(
+            token='test-token', base_url='https://weblate.example/')
+        self.utils = weblate_utils.WeblateUtils(config)
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.po_path = Path(temp_dir.name) / 'ja.po'
+        self.patches = []
+        self.uploads = []
+
+    def run_upload(self, po_content, fuzzy_units):
+        self.po_path.write_text(po_content, encoding='utf-8')
+
+        def get(url, headers=None, params=None, allow_redirects=None):
+            parts = urlsplit(url)
+            self.assertEqual('/api/' + self.UNITS_PATH, parts.path)
+            self.assertEqual(['state:needs-editing'],
+                             parse_qs(parts.query)['q'])
+            return make_response(
+                200, {'results': fuzzy_units, 'next': None})
+
+        def patch(url, json=None, headers=None, allow_redirects=None):
+            self.patches.append((urlsplit(url).path, json))
+            return make_response(200, {})
+
+        def post(url, data=None, files=None, headers=None,
+                 allow_redirects=None):
+            self.uploads.append(data)
+            return make_response(200, {'result': True})
+
+        with (
+            mock.patch.object(weblate_utils.requests, 'get', side_effect=get),
+            mock.patch.object(
+                weblate_utils.requests, 'patch', side_effect=patch),
+            mock.patch.object(
+                weblate_utils.requests, 'post', side_effect=post),
+            mock.patch.object(weblate_utils.time, 'sleep'),
+        ):
+            return self.utils.upload_po_file(
+                'neutron', 'master', 'releasenotes', 'ja',
+                str(self.po_path))
+
+    PO_HEADER = ('msgid ""\nmsgstr ""\n'
+                 '"Content-Type: text/plain; charset=UTF-8\\n"\n'
+                 '"Plural-Forms: nplurals=2; plural=(n != 1);\\n"\n\n')
+
+    def test_guess_for_untranslated_string_is_emptied(self):
+        po = self.PO_HEADER + (
+            'msgid "29.0.0"\nmsgstr ""\n\n'
+            'msgid "Bug Fixes"\nmsgstr "バグ修正"\n\n'
+            'msgid "%d volume"\nmsgid_plural "%d volumes"\n'
+            'msgstr[0] ""\nmsgstr[1] ""\n'
+        )
+        units = [
+            # msgmerge guess, Zanata untranslated -> emptied
+            {'id': 1, 'state': 10, 'context': '', 'source': ['29.0.0'],
+             'target': ['9.0.0']},
+            # Zanata translates it -> left for the upload to overwrite
+            {'id': 2, 'state': 10, 'context': '', 'source': ['Bug Fixes'],
+             'target': ['推測']},
+            # plural guess -> emptied with every plural slot
+            {'id': 3, 'state': 10, 'context': '',
+             'source': ['%d volume', '%d volumes'],
+             'target': ['%d 個', '%d 個']},
+            # translated on Weblate -> never touched
+            {'id': 4, 'state': 20, 'context': '', 'source': ['29.0.0'],
+             'target': ['x']},
+        ]
+
+        uploaded = self.run_upload(po, units)
+
+        self.assertTrue(uploaded)
+        self.assertEqual([
+            ('/api/units/1/', {'state': 0, 'target': ['']}),
+            ('/api/units/3/', {'state': 0, 'target': ['', '']}),
+        ], self.patches)
+        self.assertEqual(1, len(self.uploads))
+
+    def test_locale_without_any_translation_is_still_cleaned(self):
+        # No translation at all in Zanata: nothing is uploaded (exit
+        # code 2 path), but a guess msgmerge left must still go.
+        po = self.PO_HEADER + 'msgid "29.0.0"\nmsgstr ""\n'
+        units = [{'id': 7, 'state': 10, 'context': '',
+                  'source': ['29.0.0'], 'target': ['9.0.0']}]
+
+        uploaded = self.run_upload(po, units)
+
+        self.assertFalse(uploaded)
+        self.assertEqual(
+            [('/api/units/7/', {'state': 0, 'target': ['']})],
+            self.patches)
+        self.assertEqual([], self.uploads)
+
+    def test_nothing_to_clear_sends_no_patch(self):
+        po = self.PO_HEADER + (
+            'msgid "29.0.0"\nmsgstr ""\n\n'
+            'msgid "Bug Fixes"\nmsgstr "バグ修正"\n'
+        )
+
+        self.run_upload(po, [])
+
+        self.assertEqual([], self.patches)
+        self.assertEqual(1, len(self.uploads))
+
+
 class SourceKeyTest(unittest.TestCase):
     def test_pot_and_unit_keys_agree(self):
         content = (

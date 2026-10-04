@@ -617,6 +617,25 @@ class WeblateUtils:
 
         return self._with_connection_retry(do_post, f"Failed to post: {url}")
 
+    def _patch(self, url: str, data: dict) -> requests.Response:
+        """PATCH a JSON body, retrying connection-level failures.
+
+        See _post for the redirect and retry behavior.
+
+        :param url: The URL string to send the request to
+        :param data: The JSON-serializable body
+        :returns: requests.Response
+        """
+        def do_patch():
+            response = requests.patch(
+                url, json=data, headers=self._headers,
+                allow_redirects=False)
+            self._reject_redirect(response)
+            return response
+
+        return self._with_connection_retry(
+            do_patch, f"Failed to patch: {url}")
+
     def _retry_on_status(
         self,
         perform_request: Callable[[], requests.Response],
@@ -1541,6 +1560,64 @@ class WeblateUtils:
             self._wait_for_translation_plural_ready(translation_url, locale)
         print("[INFO] Translation created: ", locale)
 
+    def _clear_fuzzy_guesses(
+        self,
+        translation_url: str,
+        po: polib.POFile,
+        locale: str,
+    ) -> None:
+        """Empty fuzzy Weblate strings that Zanata has no translation for.
+
+        A source update (see _upload_component_source) runs msgmerge
+        with fuzzy matching, which fills new or changed source strings
+        with the translation of a similar old string, marked fuzzy -
+        e.g. "29.0.0" gets "9.0.0". When Zanata has no translation for
+        that string, the 'translate' upload has nothing to overwrite
+        the guess with, so it would stay on Weblate although Zanata
+        never had it. Only strings that are fuzzy (needs editing) with
+        content on Weblate and fully empty in this Zanata PO are
+        emptied; translated/approved strings are never touched, and
+        strings Zanata does translate are left for the upload itself,
+        which overwrites fuzzy strings.
+
+        :param translation_url: translation API URL for this locale
+        :param po: the parsed Zanata PO file about to be uploaded
+        :param locale: locale label used in log messages
+        """
+        untranslated_keys = {
+            (entry.msgctxt or '', entry.msgid, entry.msgid_plural or '')
+            for entry in po if not entry.obsolete
+            and not entry.msgstr
+            and not any(entry.msgstr_plural.values())
+        }
+        if not untranslated_keys:
+            return
+
+        units_url = urljoin(
+            translation_url,
+            'units/?' + urlencode(
+                {'q': 'state:needs-editing', 'page_size': 1000}))
+        units = self._get_all_pages(units_url, 'List fuzzy units')
+        to_clear = [
+            unit for unit in units
+            if 10 <= unit.get('state', 0) < 20
+            and any(unit.get('target') or [])
+            and get_unit_source_key(unit) in untranslated_keys
+        ]
+        for unit in to_clear:
+            url = urljoin(self.base_url, f"units/{unit['id']}/")
+            self._retry_on_status(
+                perform_request=lambda url=url, unit=unit: self._patch(
+                    url,
+                    {'state': 0, 'target': [''] * len(unit['target'])},
+                ),
+                success=lambda r: r.status_code == 200,
+                action='Clear fuzzy guess',
+            )
+        if to_clear:
+            print(f"[INFO] Cleared {len(to_clear)} fuzzy guess(es) not "
+                  f"translated in source: {locale}")
+
     def upload_po_file(
         self,
         project_name: str,
@@ -1627,6 +1704,18 @@ class WeblateUtils:
         translated_count = sum(
             1 for entry in po if not entry.obsolete
             and (entry.msgstr or any(entry.msgstr_plural.values())))
+
+        # Before the early return below: a locale with no translation
+        # at all in Zanata can still have guesses to clear.
+        component_path = self._component_api_path(
+            project_name, category_name, component_name)
+        self._clear_fuzzy_guesses(
+            urljoin(self.base_url,
+                    f'translations/{component_path}/{locale}/'),
+            po,
+            locale,
+        )
+
         if translated_count == 0:
             print("[INFO] No translation exists in source, skipping "
                   f"upload: {component_name} {locale}")
