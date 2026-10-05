@@ -116,6 +116,18 @@ class WeblateRestService(object):
         except requests.exceptions.ConnectionError:
             raise ValueError("Connection error")
 
+    def post(self, url_fragment, data):
+        request_url = self._construct_url(url_fragment)
+        try:
+            return requests.post(
+                request_url,
+                verify=self.verify,
+                headers=self.headers,
+                data=json.dumps(data),
+            )
+        except requests.exceptions.ConnectionError:
+            raise ValueError("Connection error")
+
     def _base_url(self) -> str:
         parsed_url = parse.urlparse(self.url)
         baseurl = f"{parsed_url.scheme}://{parsed_url.netloc}"

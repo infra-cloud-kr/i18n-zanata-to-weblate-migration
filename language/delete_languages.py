@@ -20,6 +20,8 @@ import json
 import requests
 from typing import Dict
 from typing import List
+from urllib.parse import urlparse
+from urllib.parse import urlunparse
 from weblate_utils import IniConfig
 from weblate_utils import WeblateRestService
 
@@ -51,12 +53,18 @@ class WeblateLanguageDeleter:
                 results = data.get('results', [])
                 all_languages.extend(results)
 
-                # Check for next page URL
+                # Check for next page URL. The server may advertise a
+                # different host (e.g. a default/placeholder SITE_DOMAIN),
+                # so always rewrite scheme+host to the one we actually
+                # connected to and keep only the path/query it provided.
                 next_url = data.get('next')
                 if next_url:
-                    if next_url.startswith('/'):
-                        next_url = f"{self.base_url}{next_url}"
-                    url = next_url
+                    parsed_next = urlparse(next_url)
+                    parsed_base = urlparse(self.base_url)
+                    url = urlunparse(parsed_next._replace(
+                        scheme=parsed_base.scheme,
+                        netloc=parsed_base.netloc,
+                    ))
                 else:
                     url = None
 
