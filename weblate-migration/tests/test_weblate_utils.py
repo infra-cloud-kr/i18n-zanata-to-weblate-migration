@@ -286,14 +286,19 @@ class WeblateUtilsReadinessTest(unittest.TestCase):
                     200,
                     {'results': [{'name': 'master', 'id': 17}]},
                 )
-            if url.endswith('/translations/neutron/'
-                            'master%252Freleasenotes/en_US/'):
+            if '/en_US/units/?page_size=1' in url and not url.endswith(
+                    'page_size=1000'):
                 state['source_checks'] += 1
                 if state['source_checks'] == 1:
-                    return make_response(200, {'total': 1})
+                    return make_response(200, {'count': 1})
 
+                return make_response(200, {'count': 2})
+            if '/en_US/units/' in url:
                 state['ready'] = True
-                return make_response(200, {'total': 2})
+                return make_response(200, {'count': 2, 'results': [
+                    {'context': '', 'source': ['first']},
+                    {'context': '', 'source': ['second']},
+                ], 'next': None})
             self.fail(f'Unexpected GET: {url}')
 
         def create_component(url, data=None, files=None, headers=None,

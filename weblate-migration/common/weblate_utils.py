@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 from typing import Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 import polib
 import requests
@@ -139,6 +139,63 @@ def get_filemask(component_name: str) -> str:
 
 def get_version_name(version: str) -> str:
     return version.replace('/', '-')
+
+
+def get_pot_source_keys(pot_path: str) -> set:
+    """Get the set of source string keys a POT file defines.
+
+    A key is (msgctxt, msgid, msgid_plural), with a missing msgctxt/
+    msgid_plural normalized to '' - the same parts Weblate hashes into
+    a bilingual unit's id_hash (source with plural forms joined, plus
+    context; see weblate.formats.base.TranslationUnit.calculate_id_hash),
+    so two entries Weblate would collapse into one unit (it keeps the
+    first and raises a DuplicateString alert for the rest) also collapse
+    into one key here. Obsolete (#~) entries are excluded, since
+    Weblate never imports them as units.
+
+    Compared as a set rather than a count because a POT whose strings
+    were replaced one-for-one keeps the same total - a count-only check
+    cannot tell it apart from an unchanged one.
+
+    :param pot_path: path to the POT file
+    :returns: set of (msgctxt, msgid, msgid_plural) tuples
+    """
+    pot = polib.pofile(pot_path)
+    return {
+        (entry.msgctxt or '', entry.msgid, entry.msgid_plural or '')
+        for entry in pot if not entry.obsolete
+    }
+
+
+def get_unit_source_key(unit: dict) -> tuple:
+    """Get a Weblate API unit's source key, as get_pot_source_keys does.
+
+    The units API returns 'source' as a list of plural forms ([msgid]
+    or [msgid, msgid_plural] for a PO unit) and the msgctxt as
+    'context' ('' when absent).
+
+    :param unit: one unit object from the Weblate units API
+    :returns: (msgctxt, msgid, msgid_plural) tuple
+    """
+    source = unit.get('source') or ['']
+    if isinstance(source, str):
+        source = [source]
+    return (
+        unit.get('context') or '',
+        source[0],
+        source[1] if len(source) > 1 else '',
+    )
+
+
+def describe_source_key_diff(expected_keys: set, actual_keys: set) -> str:
+    """Summarize how a Weblate source set differs from the POT's.
+
+    :param expected_keys: keys from get_pot_source_keys
+    :param actual_keys: keys collected via get_unit_source_key
+    :returns: short "missing=N, extra=M" description
+    """
+    return (f"missing={len(expected_keys - actual_keys)}, "
+            f"extra={len(actual_keys - expected_keys)}")
 
 
 # Matches printf-style placeholders, including flag/width/precision
@@ -560,6 +617,25 @@ class WeblateUtils:
 
         return self._with_connection_retry(do_post, f"Failed to post: {url}")
 
+    def _patch(self, url: str, data: dict) -> requests.Response:
+        """PATCH a JSON body, retrying connection-level failures.
+
+        See _post for the redirect and retry behavior.
+
+        :param url: The URL string to send the request to
+        :param data: The JSON-serializable body
+        :returns: requests.Response
+        """
+        def do_patch():
+            response = requests.patch(
+                url, json=data, headers=self._headers,
+                allow_redirects=False)
+            self._reject_redirect(response)
+            return response
+
+        return self._with_connection_retry(
+            do_patch, f"Failed to patch: {url}")
+
     def _retry_on_status(
         self,
         perform_request: Callable[[], requests.Response],
@@ -834,7 +910,7 @@ class WeblateUtils:
                         break
                 if not all_ready:
                     break
-                page_url = data.get('next')
+                page_url = self._next_page_url(data)
 
             if all_ready and checked > 0:
                 print(f"[INFO] Plural slots ready: {locale} "
@@ -850,32 +926,298 @@ class WeblateUtils:
               f"{retry_count} attempts: {last_detail}")
         sys.exit(1)
 
-    def _wait_for_component_source(
+    def _component_api_path(
+        self,
+        project_name: str,
+        category_name: str,
+        component_name: str,
+    ) -> str:
+        """Get the '<project>/<category>%252F<component>' API path part."""
+        return (f'{sanitize_slug(project_name)}/'
+                f'{sanitize_slug(category_name)}%252F'
+                f'{sanitize_slug(component_name)}')
+
+    def _next_page_url(self, data: dict):
+        """Get a paginated response's next page URL on WEBLATE_URL's host.
+
+        Weblate builds 'next' from what it thinks its own URL is, which
+        behind a TLS-terminating proxy can be http:// even though the
+        API is served over https:// (seen on weblate.printf.kr). Every
+        request here refuses redirects (see _reject_redirect), so
+        following that URL as-is fails on the 301 to https://. Only its
+        path and query are kept; scheme and host come from WEBLATE_URL.
+
+        :param data: decoded JSON body of a paginated list response
+        :returns: next page URL, or None on the last page
+        """
+        next_url = data.get('next')
+        if not next_url:
+            return None
+        base = urlsplit(self.base_url)
+        parts = urlsplit(next_url)
+        return urlunsplit(
+            (base.scheme, base.netloc, parts.path, parts.query, ''))
+
+    def _get_unit_count(self, translation_url: str):
+        """Get a translation's current unit count from the units API.
+
+        Used instead of the translation's 'total': that comes from
+        cached statistics, which Weblate only recalculates once the
+        whole background re-parse of a component has finished, so it
+        can lag the actual units by many minutes after a source update.
+
+        :param translation_url: translation API URL
+        :returns: (unit count or None, short detail for logging); None
+            when the translation isn't there yet (404) or the request
+            failed transiently - exits on a non-retryable failure
+        """
+        response = self._get(
+            urljoin(translation_url, 'units/?' + urlencode({'page_size': 1})))
+        if response.status_code == 200:
+            return response.json().get('count'), ''
+        if (response.status_code != 404
+                and not is_retryable_status(response.status_code)):
+            print(f"[ERROR] Failed to count units: {translation_url}: "
+                  f"HTTP {response.status_code}: {response.text}")
+            sys.exit(1)
+        return None, f"HTTP {response.status_code}: {response.text}"
+
+    def _get_all_pages(self, url: str, action: str) -> list:
+        """GET every page of a paginated Weblate list endpoint.
+
+        Each page is fetched with _get_with_retry, so a transient
+        failure is retried and a non-retryable one exits the process.
+
+        :param url: first page URL (may carry its own query string)
+        :param action: short label used in log and error messages
+        :returns: concatenated 'results' of every page
+        """
+        results = []
+        page_url = url
+        while page_url:
+            response = self._get_with_retry(
+                page_url,
+                success=lambda r: r.status_code == 200,
+                action=action,
+            )
+            data = response.json()
+            results.extend(data.get('results', []))
+            page_url = self._next_page_url(data)
+        return results
+
+    def _get_translation_source_keys(self, translation_url: str) -> tuple:
+        """Get the source key set of every unit in one translation.
+
+        :param translation_url: translation API URL
+        :returns: (set of source keys, number of units listed) - the
+            two differ only if Weblate listed the same key twice
+        """
+        units_url = urljoin(
+            translation_url, 'units/?' + urlencode({'page_size': 1000}))
+        units = self._get_all_pages(units_url, 'List translation units')
+        return {get_unit_source_key(unit) for unit in units}, len(units)
+
+    def _wait_for_source_keys(
+        self,
+        translation_url: str,
+        label: str,
+        expected_keys: set,
+        retry_count: int = 180,
+        sleep_time: int = 5,
+    ) -> None:
+        """Wait until a translation's units match the POT's source set.
+
+        Weblate (re)parses component files in a background task, so
+        neither a component creation nor a source upload response
+        means the new source set is visible yet. The cheap unit count
+        (see _get_unit_count) is polled first; only once it equals the
+        expected count is the full unit list fetched and compared as a
+        set - a count match alone would also accept the old source set
+        when strings were replaced one-for-one.
+
+        :param translation_url: translation API URL to poll
+        :param label: label used in log and error messages
+        :param expected_keys: keys from get_pot_source_keys
+        :param retry_count: number of status checks before giving up
+        :param sleep_time: seconds to sleep between status checks
+        :returns: None
+        """
+        assert retry_count >= 1, "retry_count must allow at least one attempt"
+        expected_total = len(expected_keys)
+        last_detail = "no response"
+
+        for cnt in range(retry_count):
+            count, count_detail = self._get_unit_count(translation_url)
+            if count is None:
+                last_detail = count_detail
+            elif count == expected_total:
+                actual_keys, unit_count = (
+                    self._get_translation_source_keys(translation_url))
+                if (actual_keys == expected_keys
+                        and unit_count == expected_total):
+                    print(f"[INFO] Source strings match POT: {label} "
+                          f"({expected_total} source strings)")
+                    return
+                diff = describe_source_key_diff(expected_keys, actual_keys)
+                last_detail = f"units={count}, {diff}"
+            else:
+                last_detail = f"units={count}, expected={expected_total}"
+
+            if cnt + 1 < retry_count:
+                print(f"[INFO] Waiting for source strings: {label} "
+                      f"({last_detail})")
+                time.sleep(sleep_time)
+
+        print(f"[ERROR] Timed out waiting for source strings {label} after "
+              f"{retry_count} attempts: {last_detail}")
+        sys.exit(1)
+
+    def _upload_component_source(
+        self,
+        source_translation_url: str,
+        pot_path: str,
+    ) -> None:
+        """Replace an existing component's source strings with a POT.
+
+        Uses Weblate's 'source' upload method on the source language
+        (en_US) translation - the supported way to update a bilingual
+        component's source strings. Weblate runs msgmerge with the
+        uploaded POT against every language's PO file (exact matches
+        keep their msgstr, plural forms and fuzzy flag; strings no
+        longer in the POT become obsolete; new ones are added
+        untranslated, or as a fuzzy guess when msgmerge's fuzzy
+        matching finds a similar old string) and replaces the new_base
+        POT, so languages added later start from the new POT too. No
+        language's translations are replaced wholesale.
+
+        The response only means the files were merged and committed -
+        the database re-parse runs as a background task, so callers
+        must wait for it (see _wait_for_source_keys).
+
+        :param source_translation_url: en_US translation API URL
+        :param pot_path: path to the new POT file
+        """
+        url = urljoin(source_translation_url, 'file/')
+        print(f"[INFO] Updating source strings from POT: {pot_path}")
+        with open(pot_path, 'rb') as f:
+            self._post_with_retry(
+                url=url,
+                success=lambda r: r.status_code == 200,
+                # _post()'s do_post rewinds `f` before every send.
+                build_kwargs=lambda: {
+                    'file': {'file': f},
+                    'data': {'method': 'source'},
+                },
+                action='Update source strings',
+            )
+
+    def _check_translation_source(
+        self,
+        translation_url: str,
+        expected_keys: set,
+    ) -> str:
+        """Compare one translation's current source set with the POT's.
+
+        One-shot (no waiting). The full unit list is only fetched when
+        the cheap unit count already equals the expected count - a
+        count mismatch is enough to know the set differs.
+
+        :param translation_url: translation API URL
+        :param expected_keys: keys from get_pot_source_keys
+        :returns: '' if the source set matches, otherwise a short
+            description of the difference
+        """
+        count, count_detail = self._get_unit_count(translation_url)
+        if count is None:
+            return count_detail
+        if count != len(expected_keys):
+            return f"units={count}, expected={len(expected_keys)}"
+        actual_keys, unit_count = self._get_translation_source_keys(
+            translation_url)
+        if actual_keys == expected_keys and unit_count == len(expected_keys):
+            return ''
+        return describe_source_key_diff(expected_keys, actual_keys)
+
+    def _list_language_translation_urls(self, component_path: str) -> dict:
+        """Map every non-source language code of a component to its URL.
+
+        :param component_path: see _component_api_path
+        :returns: dict of language code -> translation API URL
+        """
+        list_url = urljoin(
+            self.base_url,
+            f'components/{component_path}/translations/?'
+            + urlencode({'page_size': 1000}))
+        translations = self._get_all_pages(
+            list_url, 'List component translations')
+        return {
+            t['language_code']: urljoin(
+                self.base_url,
+                f"translations/{component_path}/{t['language_code']}/")
+            for t in translations if not t.get('is_source')
+        }
+
+    def _sync_existing_component_source(
         self,
         project_name: str,
         category_name: str,
         component_name: str,
         pot_path: str,
+        expected_keys: set,
     ) -> None:
-        """Wait until all POT entries are available as source strings.
+        """Bring an existing component's source strings in line with a POT.
 
-        Some Weblate versions return no component ``task_url`` even though
-        initialization is still running.  Polling the source translation is
-        the fallback readiness signal and also verifies that a completed task
-        imported the whole POT before target languages are created.
+        Every translation - en_US and each existing language - is
+        checked once against the POT's source set, not just en_US:
+        Weblate parses the source (POT) file before the language PO
+        files, so a re-run after an interrupted or slow source update
+        can find en_US already current while a language still has the
+        same number of old strings. Uploading that language's PO would
+        make 'translate' report the new strings as not_found and drop
+        them.
+
+        If everything matches (an idempotent re-run) nothing is sent.
+        Otherwise the POT is uploaded with method=source - safe to
+        repeat, since Weblate re-merges only files that still differ
+        from the POT and commits/re-parses nothing when none do - and
+        en_US plus each language that differed is waited on until its
+        source set matches. A language whose file is already merged
+        but whose database copy never catches up can't be fixed via
+        this API, so the wait times out and the process exits; the
+        caller then skips every PO upload for this component.
         """
-        pot = polib.pofile(pot_path)
-        expected_total = sum(1 for entry in pot if not entry.obsolete)
-        path = (f'translations/{sanitize_slug(project_name)}/'
-                f'{sanitize_slug(category_name)}%252F'
-                f'{sanitize_slug(component_name)}/en_US/')
-        url = urljoin(self.base_url, path)
-        self._wait_for_translation_source_units(
-            url,
-            'source en_US',
-            expected_total=expected_total,
-            retry_count=180,
-        )
+        component_path = self._component_api_path(
+            project_name, category_name, component_name)
+        source_url = urljoin(
+            self.base_url, f'translations/{component_path}/en_US/')
+
+        mismatched = {}
+        source_detail = self._check_translation_source(
+            source_url, expected_keys)
+        if source_detail:
+            mismatched['source en_US'] = (source_url, source_detail)
+        for language_code, translation_url in (
+                self._list_language_translation_urls(component_path).items()):
+            detail = self._check_translation_source(
+                translation_url, expected_keys)
+            if detail:
+                mismatched[language_code] = (translation_url, detail)
+
+        if not mismatched:
+            print("[INFO] Source strings already match POT in every "
+                  f"language ({len(expected_keys)} source strings)")
+            return
+
+        for label, (_, detail) in mismatched.items():
+            print(f"[INFO] Source strings differ from POT: {label} "
+                  f"({detail})")
+        self._upload_component_source(source_url, pot_path)
+        # en_US is always re-checked: the upload replaces new_base,
+        # and this is a single cheap check when it already matched.
+        mismatched.setdefault('source en_US', (source_url, ''))
+        for label, (translation_url, _) in mismatched.items():
+            self._wait_for_source_keys(translation_url, label, expected_keys)
+        print("[INFO] Source strings updated: ", component_name)
 
     def _build_category_list(self, project_name: str) -> dict:
         """Get category list for the project
@@ -1031,12 +1373,18 @@ class WeblateUtils:
             component_name: str,
             pot_path: str
     ) -> None:
-        """Create a new component
+        """Create a new component, or update an existing one's source
 
-        If the component does not exist, create a new one. Retries
-        up to 3 times if Weblate could not obtain its internal
-        repository lock (423) or rate-limited us (429) - see
-        is_retryable_status.
+        If the component does not exist, create a new one from the
+        POT. If it already exists (a re-run), its source strings are
+        compared with the POT's as a (msgctxt, msgid, msgid_plural)
+        set and, if they differ, updated in place with a 'source'
+        upload - see _sync_existing_component_source. Either way this
+        only returns once the source set matches the POT, and exits
+        the process otherwise, so the caller never uploads
+        translations against a stale source set. Retries up to 3
+        times if Weblate could not obtain its internal repository lock
+        (423) or rate-limited us (429) - see is_retryable_status.
 
         :param project_name: The name of the project
         :param category_name: The name of the category
@@ -1054,14 +1402,17 @@ class WeblateUtils:
             action='Check component existence',
         )
 
+        expected_keys = get_pot_source_keys(pot_path)
+
         if response.status_code == 200:
-            self._wait_for_component_source(
+            print("[INFO] Component already exists: ", component_name)
+            self._sync_existing_component_source(
                 project_name,
                 category_name,
                 component_name,
                 pot_path,
+                expected_keys,
             )
-            print("[INFO] Component already exists: ", component_name)
             return
 
         print("[INFO] Component does not exist: ", component_name)
@@ -1119,12 +1470,11 @@ class WeblateUtils:
             build_kwargs=build_kwargs,
             action='Create component',
         )
-        self._wait_for_component_source(
-            project_name,
-            category_name,
-            component_name,
-            pot_path,
-        )
+        component_path = self._component_api_path(
+            project_name, category_name, component_name)
+        source_url = urljoin(
+            self.base_url, f'translations/{component_path}/en_US/')
+        self._wait_for_source_keys(source_url, 'source en_US', expected_keys)
         print("[INFO] Component created: ", component_name)
 
     def create_translation(
@@ -1209,6 +1559,73 @@ class WeblateUtils:
         if has_plural:
             self._wait_for_translation_plural_ready(translation_url, locale)
         print("[INFO] Translation created: ", locale)
+
+    def _clear_fuzzy_guesses(
+        self,
+        translation_url: str,
+        po: polib.POFile,
+        locale: str,
+    ) -> None:
+        """Empty fuzzy Weblate strings that Zanata has no translation for.
+
+        A source update (see _upload_component_source) runs msgmerge
+        with fuzzy matching, which fills new or changed source strings
+        with the translation of a similar old string, marked fuzzy -
+        e.g. "29.0.0" gets "9.0.0". When Zanata has no translation for
+        that string, the 'translate' upload has nothing to overwrite
+        the guess with, so it would stay on Weblate although Zanata
+        never had it. Only strings that are fuzzy (needs editing) with
+        content on Weblate and fully empty in this Zanata PO are
+        emptied; translated/approved strings are never touched, and
+        strings Zanata does translate are left for the upload itself,
+        which overwrites fuzzy strings.
+
+        A Zanata entry that is fuzzy but empty ('#, fuzzy' with an empty
+        msgstr) is emptied the same way: Weblate has no state for it.
+        A PO unit only counts as fuzzy when it has content (TTKitUnit.
+        is_fuzzy is has_translation() and isfuzzy()), so importing such
+        an entry yields an untranslated string, and the units API
+        rejects a non-empty state with an empty target. State 0 is
+        therefore exactly what a fresh migration of that entry gives;
+        upload_po_file warns about these entries.
+
+        :param translation_url: translation API URL for this locale
+        :param po: the parsed Zanata PO file about to be uploaded
+        :param locale: locale label used in log messages
+        """
+        untranslated_keys = {
+            (entry.msgctxt or '', entry.msgid, entry.msgid_plural or '')
+            for entry in po if not entry.obsolete
+            and not entry.msgstr
+            and not any(entry.msgstr_plural.values())
+        }
+        if not untranslated_keys:
+            return
+
+        units_url = urljoin(
+            translation_url,
+            'units/?' + urlencode(
+                {'q': 'state:needs-editing', 'page_size': 1000}))
+        units = self._get_all_pages(units_url, 'List fuzzy units')
+        to_clear = [
+            unit for unit in units
+            if 10 <= unit.get('state', 0) < 20
+            and any(unit.get('target') or [])
+            and get_unit_source_key(unit) in untranslated_keys
+        ]
+        for unit in to_clear:
+            url = urljoin(self.base_url, f"units/{unit['id']}/")
+            self._retry_on_status(
+                perform_request=lambda url=url, unit=unit: self._patch(
+                    url,
+                    {'state': 0, 'target': [''] * len(unit['target'])},
+                ),
+                success=lambda r: r.status_code == 200,
+                action='Clear fuzzy guess',
+            )
+        if to_clear:
+            print(f"[INFO] Cleared {len(to_clear)} fuzzy guess(es) not "
+                  f"translated in source: {locale}")
 
     def upload_po_file(
         self,
@@ -1296,6 +1713,30 @@ class WeblateUtils:
         translated_count = sum(
             1 for entry in po if not entry.obsolete
             and (entry.msgstr or any(entry.msgstr_plural.values())))
+        # Weblate can't store a fuzzy flag on an empty string (see
+        # _clear_fuzzy_guesses), so these always end up untranslated.
+        empty_fuzzy_count = sum(
+            1 for entry in po if not entry.obsolete
+            and 'fuzzy' in entry.flags
+            and not entry.msgstr
+            and not any(entry.msgstr_plural.values()))
+        if empty_fuzzy_count:
+            print(f"[WARN] {empty_fuzzy_count} fuzzy entries without "
+                  "translation in source will be untranslated on Weblate "
+                  "(no fuzzy state for an empty string): "
+                  f"{component_name} {locale}")
+
+        # Before the early return below: a locale with no translation
+        # at all in Zanata can still have guesses to clear.
+        component_path = self._component_api_path(
+            project_name, category_name, component_name)
+        self._clear_fuzzy_guesses(
+            urljoin(self.base_url,
+                    f'translations/{component_path}/{locale}/'),
+            po,
+            locale,
+        )
+
         if translated_count == 0:
             print("[INFO] No translation exists in source, skipping "
                   f"upload: {component_name} {locale}")
